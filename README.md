@@ -4,13 +4,20 @@
 
 # am-build-vars
 
-A composite GitHub Action that reads per-repository build variables from a committed
-`am-build-vars.yml` and hands them to the rest of the job — so one **byte-identical**
-workflow file can produce different results in every repository it is deployed to.
+A composite GitHub Action that does two things, both aimed at the same problem: keeping
+one workflow file identical across a fleet of repositories while every repository still
+builds the way it needs to.
+
+| | What it does |
+|---|---|
+| **Per-repo build variables** | Each repository commits an `am-build-vars.yml`. Its keys become environment variables, so the shared workflow never needs a per-repo edit. |
+| **Sharing across workflows** | A value your build *computes* — an image tag, a version — is readable later by a **different workflow file, in a different run**. No `needs:`, no `workflow_run` plumbing, no artifact wiring. |
+
+Read a repo's config:
 
 ```yaml
 - uses: actions/checkout@v7
-- uses: dawg-io/am-build-vars@v1
+- uses: greywolflabs/am-build-vars@v1
   with:
     defaults: |
       node_version: "20"
@@ -18,12 +25,59 @@ workflow file can produce different results in every repository it is deployed t
 - run: echo "Building with Node $node_version"
 ```
 
-## How it works
+Hand a computed value to another workflow:
+
+```yaml
+# in build.yml — publish it
+- uses: greywolflabs/am-build-vars@v1
+  with:
+    share-env: image_tag
+
+# in deploy.yml, a later run — read it back
+- uses: greywolflabs/am-build-vars@v1
+  with:
+    load-shared: true
+- run: ./deploy.sh "$image_tag"
+```
+
+## Contents
+
+**Guide**
+
+1. [Per-repo build variables](#1-per-repo-build-variables) — the committed config file
+2. [Sharing variables across workflows](#2-sharing-variables-across-workflows) — the shared store
+3. [Getting values out of the action](#3-getting-values-out-of-the-action) — env, outputs, other jobs
+
+**Reference** — [Inputs](#inputs) · [Outputs](#outputs) · [Errors](#errors)
+
+**Operating** — [Requirements](#requirements) · [Security](#security) · [Versioning](#versioning) · [Not in scope for v1](#not-in-scope-for-v1) · [Development](#development)
+
+## Concepts
+
+Two different things in this document get called "variables". Telling them apart is most
+of understanding the action:
+
+| Term | What it is | Where you write it |
+|---|---|---|
+| **build variable** | A value your build needs — `node_version`, `test_command`, `image_tag`. The name you give it *is* the environment variable name your steps read. | `am-build-vars.yml`, the `defaults` input, or the shared store |
+| **input** | A setting that configures this action itself — where to look for the file, whether to share. There are ten, all optional. | the step's `with:` block |
+| **the store** | One small JSON file, kept as an Actions artifact, holding the build variables a run published for later runs to read. | nowhere — the action manages it |
+
+Build variables are yours, and there is no limit on them. Inputs are this action's ten
+knobs, and a typical workflow sets two or three. [Inputs](#inputs) lists every one.
+
+**Requirement for both parts below:** run `actions/checkout` first. This action reads a
+file from the workspace; it does not check the repository out itself. See
+[Requirements](#requirements) for the rest.
+
+## 1. Per-repo build variables
+
+### How it works
 
 1. A repository commits an `am-build-vars.yml` — in the repository root, or in
    `.github/`. One filename, either home; the action finds it.
-2. This action reads it, filling in any key the file does not define from the workflow's
-   inline `defaults`.
+2. The action reads it, filling in any key the file does not define from the workflow's
+   inline `defaults` input.
 3. **Every key becomes an environment variable with the same name**, for every later step
    in the job.
 
@@ -37,20 +91,18 @@ Step 3 is the whole interface. The key you write in the file *is* the variable n
 
 Same name, same case, no prefix. Nothing to declare up front, and the step needs no `id`.
 
-Values computed *during* a run can join the same picture — see
-[Sharing variables across workflows](#sharing-variables-across-workflows).
+If the file does not exist, the action still succeeds — it just resolves whatever
+`defaults` gave it, and zero keys if there were none.
 
-## The problem it solves
+### Why this exists
 
 Tools that manage workflows across a fleet of repositories — [ActionsManager][am] among
 them — apply the same workflow definition everywhere and use drift detection to keep it
 that way. The moment a repository edits its copy to bump a Node version, it is flagged as
 drifted.
 
-But real teams need that variation. One service is on Node 20, the next is on Node 24,
-a third needs a different runner label.
-
-This action splits the two concerns apart:
+But real teams need that variation. One service is on Node 20, the next is on Node 24, a
+third needs a different runner label. This action splits the two concerns apart:
 
 | | Owned by | Identical across repos? |
 |---|---|---|
@@ -63,6 +115,428 @@ detection stays happy because the workflow file never changes.
 
 This action has no runtime dependency on ActionsManager and works standalone in any
 repository. It makes no API calls at all unless you turn sharing on.
+
+### Worked example
+
+The workflow below is committed **identically** to every repository in the fleet:
+
+```yaml
+name: Build
+on: [push]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: greywolflabs/am-build-vars@v1
+        with:
+          defaults: |
+            node_version: "20"
+            test_command: npm test
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ env.node_version }}
+      - run: npm ci
+      - run: ${{ env.test_command }}
+```
+
+**Repo A** — no `am-build-vars.yml` at all:
+
+```
+node_version  = 20          (default)
+test_command  = npm test    (default)
+```
+
+**Repo B** — `am-build-vars.yml` in the repository root:
+
+```yaml
+node_version: "24"
+```
+
+```
+node_version  = 24          (from the file — overrides the default)
+test_command  = npm test    (default — untouched)
+```
+
+Same workflow file, byte for byte. Different builds.
+
+> **Why YAML for `defaults`?** It is the same syntax as the config file, parsed by the
+> same code path, with the same type handling — one thing to learn instead of two, and a
+> default can be moved into a repo's config file by copy-paste. JSON is valid YAML, so
+> `defaults: '{"node_version": "20"}'` works too if you are generating the workflow.
+
+### Value types
+
+**v1 resolves top-level keys only.** Precedence is evaluated per top-level key: a key
+present in the config file replaces the default entirely. There is no deep merge, and no
+dotted-path access.
+
+Values, however, may be any YAML type:
+
+| YAML value | Resolved to |
+|---|---|
+| `"20"` | `20` |
+| `20` | `20` |
+| `true` / `false` | `true` / `false` (lowercase strings) |
+| `null` / empty | `` (empty string) |
+| `[18, 20, 24]` | `[18,20,24]` (compact JSON) |
+| `{target: prod}` | `{"target":"prod"}` (compact JSON) |
+| a `\|` block scalar | the text, newlines intact |
+
+Lists and mappings arrive as JSON strings, so consuming one takes a `fromJSON()` at the
+point of use:
+
+```yaml
+# am-build-vars.yml
+test_matrix: ["18", "20", "24"]
+```
+
+```yaml
+strategy:
+  matrix:
+    node: ${{ fromJSON(needs.config.outputs.test_matrix) }}
+```
+
+> **Quote your version numbers.** YAML reads unquoted `20.10` as the float `20.1` and
+> unquoted `on`, `yes` and `no` as booleans. `"20.10"` gives you the string you meant.
+
+### Key names
+
+Keys must match `^[A-Za-z_][A-Za-z0-9_]*$` — letters, digits and underscores, not starting
+with a digit. Use `node_version`, not `node-version` or `node.version`.
+
+This is enforced rather than silently rewritten, so the JSON key and the environment
+variable name are always the same string. A dashed key that became `node_version` in the
+environment but stayed `node-version` in `json` would be a permanent source of confusion.
+
+## 2. Sharing variables across workflows
+
+Part 1 covers values that are static — known before the run starts. The other half of the
+problem is a value the run **computes**: an image tag, a version, a build id, needed later
+by a *different workflow file*. GitHub gives you `needs.<job>.outputs` inside one run and
+nothing at all across runs, so this normally ends in hand-rolled `workflow_run` and
+artifact plumbing in every repository — exactly the per-repo drift this action exists to
+remove.
+
+The shared store closes that gap. It is a small JSON file kept as an Actions artifact: one
+step publishes into it, a later step anywhere in the repository reads it back as an
+ordinary environment variable, same name-is-the-name rule as Part 1.
+
+### Quick start
+
+**The producer** publishes what the run computed:
+
+```yaml
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read       # required — publishing reads the store to merge into
+    steps:
+      - uses: actions/checkout@v7
+      - run: echo "image_tag=sha-$(git rev-parse --short HEAD)" >> "$GITHUB_ENV"
+
+      - uses: greywolflabs/am-build-vars@v1
+        with:
+          share-env: image_tag
+```
+
+**The consumer** is a different workflow file, in a later run:
+
+```yaml
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read       # required to read the store
+    steps:
+      - uses: actions/checkout@v7
+      - uses: greywolflabs/am-build-vars@v1
+        with:
+          load-shared: true
+
+      - run: ./deploy.sh "$image_tag"
+```
+
+No `needs:`, no job outputs, no artifact plumbing. The variable is simply there.
+
+### Publishing: `share-env` or `share`
+
+| Input | Takes | Use it for |
+|---|---|---|
+| `share-env` | **names** of environment variables | anything computed during the run |
+| `share` | a YAML mapping, same syntax as `defaults` | literals and workflow expressions |
+
+Prefer `share-env` for computed values. It reads the value straight out of the environment,
+so a tag containing a quote, a brace or a newline never has to survive a trip through YAML:
+
+```yaml
+- uses: greywolflabs/am-build-vars@v1
+  with:
+    # names, whitespace- or comma-separated — safe whatever the values hold
+    share-env: image_tag deploy_target
+
+    # fine for literals; this one is being pasted into a YAML document
+    share: |
+      release_channel: stable
+```
+
+A name that is not set when the step runs is an **error**, not an empty value — a typo in a
+`share-env` list should not quietly publish `""`.
+
+Publishing **merges** into the store rather than replacing it, so a build workflow sharing
+`image_tag` and a deploy workflow sharing `deployed_at` both survive and a consumer sees
+both. That merge is also why a producer needs `actions: read`: it reads the store it is
+about to write back.
+
+### Scope — which store you read and write
+
+A scope is a namespace: steps using the same one see each other's values, different ones
+are fully isolated. It defaults to the **current ref name**, so every branch reads and
+writes its own store and a pull request cannot disturb `main`'s.
+
+| Run | Scope | Store artifact |
+|---|---|---|
+| push to `main` | `main` | `am-build-vars-store-main` |
+| push tag `v1.2.3` | `v1.2.3` | `am-build-vars-store-v1.2.3` |
+| PR #123 | `123/merge` | `am-build-vars-store-123-merge-99b03923` |
+| push to `feat/x` | `feat/x` | `am-build-vars-store-feat-x-79b4cc55` |
+
+An artifact name cannot contain a `/`, so a scope carrying one is slugged. Slugging alone
+would let `feat/x` and `feat-x` land on the *same* store — a value set on one branch
+surfacing on the other — so a short digest of the original scope is appended whenever
+slugging changed anything. Scopes that need no slugging keep the readable name, which is
+the common case.
+
+That default isolates, which also means a tag-triggered deploy will **not** see what a build
+on `main` published. When you want it to, name the scope explicitly on both sides:
+
+```yaml
+- uses: greywolflabs/am-build-vars@v1
+  with:
+    load-shared: true
+    share-scope: main      # read what builds on main published
+```
+
+### Precedence — where a value comes from
+
+Sharing adds two layers to the two Part 1 already had. Lowest to highest:
+
+| Layer | Comes from | Beats |
+|---|---|---|
+| `defaults` | the workflow's inline defaults | — |
+| **shared** | the store, when `load-shared: true` | `defaults` |
+| file | the committed `am-build-vars.yml` | shared |
+| **share** | what this step is publishing | everything |
+
+The committed file **outranks** the store deliberately: config a team just committed should
+never lose to an artifact some run left behind months ago. In practice the two rarely meet —
+a key like `image_tag` is one nobody commits.
+
+What a step publishes outranks everything, so the value written to the store and the value
+the rest of that job sees can never disagree.
+
+The `sources` output says which layer each key actually came from — worth asserting on in a
+test, and it prints no values:
+
+```yaml
+- uses: greywolflabs/am-build-vars@v1
+  id: vars
+  with:
+    load-shared: true
+
+- run: echo '${{ steps.vars.outputs.sources }}'
+  # {"image_tag":"shared","node_version":"file","runner":"default"}
+```
+
+### Before you rely on it
+
+- **Permissions.** Producing *and* consuming need `actions: read` in the job's
+  `permissions:` block. Without it the step fails naming the missing permission, rather
+  than quietly resolving nothing.
+- **Artifacts expire.** The store lives exactly as long as its artifact — 90 days by
+  default, or whatever `share-retention-days` and the repository's settings say. A value
+  nobody republishes eventually disappears.
+- **Every publishing run leaves its own copy**, and the reader takes the newest. That is
+  where the history comes from, and also why a busy scope fills up a run list — set
+  `share-retention-days` low for a store that only has to survive until the next job.
+- **Concurrent producers race.** Two runs publishing to one scope at once both read, then
+  both write; the later write wins and the earlier one's new keys are lost. Put a
+  `concurrency:` group on the producing workflow if that matters.
+- **A missing store is not an error.** The first run in a new scope resolves zero shared
+  keys and carries on. Assert it yourself when a value is mandatory:
+
+  ```yaml
+  - if: env.image_tag == ''
+    run: |
+      echo "::error::nothing has published image_tag for this scope yet"
+      exit 1
+  ```
+- **Never share a secret.** The store is an artifact, and in a public repository artifacts
+  are downloadable by anyone. See [Security](#security).
+- **One repository only.** A store is repository-local; there is no cross-repo sharing.
+
+## 3. Getting values out of the action
+
+Environment variables are the default route and cover most workflows: every resolved key is
+written to `$GITHUB_ENV` under its own name, readable by every later step in the job as
+`$KEY` in a shell or `${{ env.KEY }}` in an expression.
+
+### When environment variables are not enough
+
+Three cases the env export cannot cover. All three are GitHub Actions constraints, not
+choices this action makes.
+
+| Case | Why | Use |
+|---|---|---|
+| The same step that runs the action | `$GITHUB_ENV` only takes effect in *later* steps | the `json` output |
+| A different job | jobs do not share an environment | a config job (below), or [the shared store](#2-sharing-variables-across-workflows) |
+| `runs-on`, `strategy.matrix` | evaluated before any step runs | a config job (below) |
+
+For these, give the step an `id` and read the `json` output — every resolved key, as one
+JSON object:
+
+```yaml
+- uses: greywolflabs/am-build-vars@v1
+  id: vars
+- run: echo "Node ${{ fromJSON(steps.vars.outputs.json).node_version }}"
+```
+
+### Passing values to another job
+
+Put the verbose form in the config job's `outputs:` block once. Everything downstream is
+then a plain `needs.config.outputs.<key>`:
+
+```yaml
+jobs:
+  config:
+    runs-on: ubuntu-latest
+    outputs:
+      runner: ${{ fromJSON(steps.vars.outputs.json).runner }}
+      test_matrix: ${{ fromJSON(steps.vars.outputs.json).test_matrix }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: greywolflabs/am-build-vars@v1
+        id: vars
+        with:
+          defaults: |
+            runner: ubuntu-latest
+            test_matrix: ["20"]
+
+  build:
+    needs: config
+    runs-on: ${{ needs.config.outputs.runner }}
+    strategy:
+      matrix:
+        node: ${{ fromJSON(needs.config.outputs.test_matrix) }}
+    steps:
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ matrix.node }}
+```
+
+`test_matrix` is unwrapped twice: once by the config job's output expression, once by
+`fromJSON` in `strategy.matrix`.
+
+That pattern is the right one for *config* — values that exist before the run starts, which
+`runs-on` and `strategy.matrix` need evaluated before any step runs. For a value the run
+itself computes, reach for [the shared store](#2-sharing-variables-across-workflows)
+instead: it needs no `needs:` edge at all, and it works across workflow files.
+
+> Passing a value into a shell script? Prefer `env:` over inlining the expression — it
+> keeps quoting sane and multi-line values intact:
+>
+> ```yaml
+> - env:
+>     NOTES: ${{ fromJSON(steps.vars.outputs.json).release_notes }}
+>   run: printf '%s' "$NOTES" > notes.txt
+> ```
+
+## Inputs
+
+All ten are optional — the action runs with no `with:` block at all, discovering
+`am-build-vars.yml` and exporting whatever it finds. Every value is a string, as always in
+Actions: the boolean ones take `true`, `1`, `yes` or `on` in any case, and anything else is
+false. Do not pad them — `load-shared: ' true '` is refused outright rather than
+half-honoured, because the composite's own step condition has no `trim()` to call.
+
+### Reading the config file
+
+| Input | What it does | Default |
+|---|---|---|
+| `defaults` | Fleet-wide fallback values, as a YAML mapping using the same syntax as the config file. Any key the repository's file does not define comes from here. **This is the one a managed workflow sets.** | `''` |
+| `config-file` | Read exactly this path instead of auto-discovering `am-build-vars.yml`. Relative to the workspace root; an absolute path also works. Rarely needed. | `''` |
+| `fail-on-missing` | Fail the step when the repository has no config file, instead of carrying on with `defaults` alone. Turn it on to require every repository to carry one. | `'false'` |
+| `export-env` | Write every resolved key to `$GITHUB_ENV`. Set `'false'` to leave the job environment untouched and read values through the `json` output only — the way to keep a value out of the job log. | `'true'` |
+
+### Sharing
+
+Every input here needs `actions: read` in the job's `permissions:` block, publishing
+included. See [Part 2](#2-sharing-variables-across-workflows).
+
+| Input | What it does | Default |
+|---|---|---|
+| `share` | Publish these values to the store, as a YAML mapping. Good for literals and workflow expressions. Merges into the store rather than replacing it, and outranks every other layer in this step. | `''` |
+| `share-env` | Publish the named environment variables to the store — names, whitespace- or comma-separated. **This is the one for values the run computed**, since the value never has to survive YAML quoting. A name that is not set is an error. | `''` |
+| `load-shared` | Read this scope's store and apply it. Off by default, so a workflow that does not share makes no API call and needs no extra permission. Outranks `defaults`, loses to the committed file. | `'false'` |
+| `share-scope` | Which store to read and write. Same scope, same store; different scopes never see each other. Defaults to the current ref, so branches stay isolated — set it explicitly when one ref must read what another published. | `${{ github.ref_name }}` |
+| `share-token` | The token used to list the store artifact and start its download. The default is right in nearly every case; pass a different one only to widen what the lookup can see. | `${{ github.token }}` |
+| `share-retention-days` | How long the store artifact is kept, in days, passed straight to `actions/upload-artifact`. Empty uses the repository default, 90 days unless changed. This is how long a published value stays readable. | `''` |
+
+Beyond these, the action reads only what the runner sets for it — `GITHUB_ENV`,
+`GITHUB_OUTPUT`, `GITHUB_WORKSPACE`, `GITHUB_REPOSITORY`, `GITHUB_RUN_ID`,
+`GITHUB_WORKFLOW`, `GITHUB_SHA`, `GITHUB_API_URL`, `RUNNER_TEMP` — plus the variables
+`share-env` names. There is nothing else to set.
+
+## Outputs
+
+| Output | Description |
+|---|---|
+| `json` | Every resolved key/value pair as a compact JSON object. |
+| `keys` | The resolved key names as a sorted JSON array. |
+| `config-file-used` | The path actually read, or `''` when only defaults were applied. |
+| `sources` | Where each key came from, as JSON: `default`, `shared`, `file` or `share`. |
+| `shared-json` | The values that came from the shared store, as JSON. `{}` when none did. |
+| `shared-run-id` | The run whose store was applied, or `''`. Provenance for a value from outside this run. |
+
+Every resolved key is also a step output under its own name, so a build variable called
+`json`, `keys` or `sources` shadows the output of that name — the metadata wins, and the
+config value is unreachable through `steps.<id>.outputs`. It is still in `env`. Only these
+three collide, because a key may not contain a hyphen.
+
+## Errors
+
+The action fails, with a message naming the file, when:
+
+- the YAML is malformed (the parser's line and column are included);
+- the top level of the file or of `defaults` is not a mapping;
+- `am-build-vars.yml` exists in **both** the root and `.github/` — the action refuses to
+  pick one silently;
+- an `am-build-vars.yaml` exists and no `.yml` does. Only `.yml` is read, and quietly
+  building with fleet defaults instead of the config you wrote is the worse outcome, so
+  this is an error telling you to rename it;
+- a key is not a valid name, or collides with a runner-owned variable;
+- `fail-on-missing: true` and the file is absent.
+
+A missing config file is **not** an error in the default configuration.
+
+Sharing adds its own, all of them naming what to fix:
+
+- `share-env` names a variable that is not set when the step runs;
+- a shared key is not a valid name, or collides with a runner-owned variable;
+- the token cannot read the repository's artifacts — the message names the
+  `actions: read` permission;
+- the store is unreadable: not JSON, or written by a newer schema than this action reads.
+  A corrupted store is an error rather than a silent fall-through to nothing, because the
+  caller asked for values a previous run published and quietly building without them is
+  the confusing outcome;
+- the store would grow past 512 KiB. It is meant for build coordinates, not payloads.
+
+Finding **no** store is not an error: the first run in a new scope resolves zero shared
+keys and carries on.
 
 ## Requirements
 
@@ -98,451 +572,12 @@ it should be auditable in a coffee break.
 
 Leave sharing off and this action makes no network calls of its own. Turn it on and it
 lists the repository's artifacts through the REST API and uses
-[`actions/upload-artifact`][upload] to write the store — see
-[Sharing variables across workflows](#sharing-variables-across-workflows).
+[`actions/upload-artifact`][upload] to write the store.
 
 One honest caveat about that dependency: a step's `if:` decides whether the step *runs*,
 not whether the runner *resolves* it. `actions/upload-artifact` is therefore fetched during
 job setup on every run, sharing or not — you will see it in the "Prepare all required
 actions" group. It only ever executes when there is something to publish.
-
-## Usage
-
-### Minimal
-
-The repository's `am-build-vars.yml` is the only source of values.
-
-```yaml
-steps:
-  - uses: actions/checkout@v7
-  - uses: dawg-io/am-build-vars@v1
-
-  - run: echo "Building with Node $node_version"
-```
-
-```yaml
-# am-build-vars.yml
-node_version: "20"
-```
-
-If the file does not exist, the action still succeeds — it just resolves zero keys.
-
-### With inline defaults
-
-This is the managed-workflow shape. `defaults` is a YAML mapping using exactly the same
-syntax as the config file.
-
-```yaml
-steps:
-  - uses: actions/checkout@v7
-  - uses: dawg-io/am-build-vars@v1
-    with:
-      defaults: |
-        node_version: "20"
-        runner: ubuntu-latest
-        coverage_enabled: true
-        test_command: npm test
-
-  - uses: actions/setup-node@v7
-    with:
-      node-version: ${{ env.node_version }}
-  - run: ${{ env.test_command }}
-  - run: npm run coverage
-    if: env.coverage_enabled == 'true'
-```
-
-> **Why YAML for `defaults`?** It is the same syntax as the config file, parsed by the
-> same code path, with the same type handling — one thing to learn instead of two, and a
-> default can be moved into a repo's config file by copy-paste. JSON is valid YAML, so
-> `defaults: '{"node_version": "20"}'` works too if you are generating the workflow.
-
-### Per-repo override — the whole point
-
-The workflow below is committed **identically** to every repository in the fleet:
-
-```yaml
-name: Build
-on: [push]
-jobs:
-  build:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-      - uses: dawg-io/am-build-vars@v1
-        with:
-          defaults: |
-            node_version: "20"
-            test_command: npm test
-
-      - uses: actions/setup-node@v7
-        with:
-          node-version: ${{ env.node_version }}
-      - run: npm ci
-      - run: ${{ env.test_command }}
-```
-
-**Repo A** — no `am-build-vars.yml` at all:
-
-```
-node_version  = 20          (default)
-test_command  = npm test    (default)
-```
-
-**Repo B** — `am-build-vars.yml` in the repository root:
-
-```yaml
-node_version: "24"
-```
-
-```
-node_version  = 24          (from the file — overrides the default)
-test_command  = npm test    (default — untouched)
-```
-
-Same workflow file, byte for byte. Different builds.
-
-## Sharing variables across workflows
-
-Everything above is static — known before the run starts. The other half of the problem is
-a value the run **computes**: an image tag, a version, a build id, needed later by a
-*different workflow file*. GitHub gives you `needs.<job>.outputs` inside one run and
-nothing at all across runs, so this normally ends in hand-rolled `workflow_run` and
-artifact plumbing in every repository — the per-repo drift this action exists to remove.
-
-The shared store closes that gap. It is a small JSON file kept as an Actions artifact: one
-step publishes into it, a later step anywhere in the repository reads it back as an
-ordinary variable, same name-is-the-name rule.
-
-**The producer** publishes what the run computed:
-
-```yaml
-jobs:
-  build:
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      actions: read
-    steps:
-      - uses: actions/checkout@v7
-      - run: echo "image_tag=sha-$(git rev-parse --short HEAD)" >> "$GITHUB_ENV"
-
-      - uses: dawg-io/am-build-vars@v1
-        with:
-          share-env: image_tag
-```
-
-**The consumer** is a different workflow file, in a later run:
-
-```yaml
-jobs:
-  deploy:
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      actions: read       # required to read the store
-    steps:
-      - uses: actions/checkout@v7
-      - uses: dawg-io/am-build-vars@v1
-        with:
-          load-shared: true
-
-      - run: ./deploy.sh "$image_tag"
-```
-
-No `needs:`, no job outputs, no artifact plumbing. The variable is simply there.
-
-### Publishing: `share-env` or `share`
-
-| Input | Takes | Use it for |
-|---|---|---|
-| `share-env` | **names** of environment variables | anything computed during the run |
-| `share` | a YAML mapping, same syntax as `defaults` | literals and workflow expressions |
-
-Prefer `share-env` for computed values. It reads the value straight out of the environment,
-so a tag containing a quote, a brace or a newline never has to survive a trip through YAML:
-
-```yaml
-- uses: dawg-io/am-build-vars@v1
-  with:
-    # names, whitespace- or comma-separated — safe whatever the values hold
-    share-env: image_tag deploy_target
-
-    # fine for literals; this one is being pasted into a YAML document
-    share: |
-      release_channel: stable
-```
-
-A name that is not set when the step runs is an **error**, not an empty value — a typo in a
-`share-env` list should not quietly publish `""`.
-
-### Precedence
-
-Publishing adds two layers to the two you already had. Lowest to highest:
-
-| Layer | Comes from | Beats |
-|---|---|---|
-| `defaults` | the workflow's inline defaults | — |
-| **shared** | the store, when `load-shared: true` | `defaults` |
-| file | the committed `am-build-vars.yml` | shared |
-| **share** | what this step is publishing | everything |
-
-The committed file **outranks** the store deliberately: config a team just committed should
-never lose to an artifact some run left behind months ago. In practice the two rarely meet —
-a key like `image_tag` is one nobody commits.
-
-What a step publishes outranks everything, so the value written to the store and the value
-the rest of that job sees can never disagree.
-
-The `sources` output says which layer each key actually came from — worth asserting on in a
-test, and it prints no values:
-
-```yaml
-- uses: dawg-io/am-build-vars@v1
-  id: vars
-  with:
-    load-shared: true
-
-- run: echo '${{ steps.vars.outputs.sources }}'
-  # {"image_tag":"shared","node_version":"file","runner":"default"}
-```
-
-### Scope
-
-A scope is a namespace: steps using the same one see each other's values, different ones
-are fully isolated. It defaults to the **current ref name**, so every branch reads and
-writes its own store and a pull request cannot disturb `main`'s.
-
-| Run | Scope | Store artifact |
-|---|---|---|
-| push to `main` | `main` | `am-build-vars-store-main` |
-| push tag `v1.2.3` | `v1.2.3` | `am-build-vars-store-v1.2.3` |
-| PR #123 | `123/merge` | `am-build-vars-store-123-merge-99b03923` |
-| push to `feat/x` | `feat/x` | `am-build-vars-store-feat-x-79b4cc55` |
-
-An artifact name cannot contain a `/`, so a scope carrying one is slugged. Slugging alone
-would let `feat/x` and `feat-x` land on the *same* store — a value set on one branch
-surfacing on the other — so a short digest of the original scope is appended whenever
-slugging changed anything. Scopes that need no slugging keep the readable name, which is
-the common case.
-
-That default isolates, which also means a tag-triggered deploy will **not** see what a build
-on `main` published. When you want it to, name the scope explicitly on both sides:
-
-```yaml
-- uses: dawg-io/am-build-vars@v1
-  with:
-    load-shared: true
-    share-scope: main      # read what builds on main published
-```
-
-### The store accumulates
-
-Publishing **merges** into the store rather than replacing it, so a build workflow sharing
-`image_tag` and a deploy workflow sharing `deployed_at` both survive and a consumer sees
-both. That merge is also why a producer needs `actions: read`: it reads the store it is
-about to write back.
-
-### Before you rely on it
-
-- **Permissions.** Producing *and* consuming need `actions: read` in the job's
-  `permissions:` block. Without it the step fails naming the missing permission, rather
-  than quietly resolving nothing.
-- **Artifacts expire.** The store lives exactly as long as its artifact — 90 days by
-  default, or whatever `share-retention-days` and the repository's settings say. A value
-  nobody republishes eventually disappears.
-- **Every publishing run leaves its own copy**, and the reader takes the newest. That is
-  where the history comes from, and also why a busy scope fills up a run list — set
-  `share-retention-days` low for a store that only has to survive until the next job.
-- **Concurrent producers race.** Two runs publishing to one scope at once both read, then
-  both write; the later write wins and the earlier one's new keys are lost. Put a
-  `concurrency:` group on the producing workflow if that matters.
-- **A missing store is not an error.** The first run in a new scope resolves zero shared
-  keys and carries on. Assert it yourself when a value is mandatory:
-
-  ```yaml
-  - if: env.image_tag == ''
-    run: |
-      echo "::error::nothing has published image_tag for this scope yet"
-      exit 1
-  ```
-- **Never share a secret.** The store is an artifact, and in a public repository artifacts
-  are downloadable by anyone. See [Security](#security).
-
-## Inputs
-
-| Input | Default | Description |
-|---|---|---|
-| `config-file` | `''` | Explicit path to the file, turning discovery off. Leave empty to search the root then `.github/`. |
-| `defaults` | `''` | Fleet-wide defaults as a YAML mapping. Applied to any key the config file does not define. |
-| `export-env` | `'true'` | Write every resolved key to `$GITHUB_ENV`, overwriting any existing variable of the same name. Set `'false'` to leave the job environment untouched. |
-| `fail-on-missing` | `'false'` | Fail the step when the config file is absent, instead of falling back to defaults only. |
-| `share` | `''` | Values to publish to the shared store, as a YAML mapping. |
-| `share-env` | `''` | Names of environment variables to capture and publish, separated by whitespace or commas. |
-| `load-shared` | `'false'` | Read the shared store for this scope and apply it. Needs `actions: read`. |
-| `share-scope` | `github.ref_name` | The namespace shared values live in. Same scope, same store. |
-| `share-token` | `github.token` | Token used to look the store artifact up. |
-| `share-retention-days` | `''` | How long the store artifact is kept. Empty uses the repository default. |
-
-## Outputs
-
-| Output | Description |
-|---|---|
-| `json` | Every resolved key/value pair as a compact JSON object. |
-| `keys` | The resolved key names as a sorted JSON array. |
-| `config-file-used` | The path actually read, or `''` when only defaults were applied. |
-| `sources` | Where each key came from, as JSON: `default`, `shared`, `file` or `share`. |
-| `shared-json` | The values that came from the shared store, as JSON. `{}` when none did. |
-| `shared-run-id` | The run whose store was applied, or `''`. Provenance for a value from outside this run. |
-
-Every resolved key is also a step output under its own name, so a key called `json`, `keys`
-or `sources` shadows the output of that name — the metadata wins, and the config value is
-unreachable through `steps.<id>.outputs`. It is still in `env`. Only these three collide;
-the hyphenated names cannot, because a key may not contain a hyphen.
-
-## When environment variables are not enough
-
-Three cases the env export cannot cover. All three are GitHub Actions constraints, not
-choices this action makes.
-
-| Case | Why | Use |
-|---|---|---|
-| The same step that runs the action | `$GITHUB_ENV` only takes effect in *later* steps | the `json` output |
-| A different job | jobs do not share an environment | a config job (below), or [the shared store](#sharing-variables-across-workflows) |
-| `runs-on`, `strategy.matrix` | evaluated before any step runs | a config job (below) |
-
-For these, give the step an `id` and read the `json` output — every resolved key, as one
-JSON object:
-
-```yaml
-- uses: dawg-io/am-build-vars@v1
-  id: vars
-- run: echo "Node ${{ fromJSON(steps.vars.outputs.json).node_version }}"
-```
-
-### Passing values to another job
-
-Put the verbose form in the config job's `outputs:` block once. Everything downstream is
-then a plain `needs.config.outputs.<key>`:
-
-```yaml
-jobs:
-  config:
-    runs-on: ubuntu-latest
-    outputs:
-      runner: ${{ fromJSON(steps.vars.outputs.json).runner }}
-      test_matrix: ${{ fromJSON(steps.vars.outputs.json).test_matrix }}
-    steps:
-      - uses: actions/checkout@v7
-      - uses: dawg-io/am-build-vars@v1
-        id: vars
-        with:
-          defaults: |
-            runner: ubuntu-latest
-            test_matrix: ["20"]
-
-  build:
-    needs: config
-    runs-on: ${{ needs.config.outputs.runner }}
-    strategy:
-      matrix:
-        node: ${{ fromJSON(needs.config.outputs.test_matrix) }}
-    steps:
-      - uses: actions/setup-node@v7
-        with:
-          node-version: ${{ matrix.node }}
-```
-
-`test_matrix` is unwrapped twice: once by the config job's output expression, once by
-`fromJSON` in `strategy.matrix`.
-
-That pattern is the right one for *config* — values that exist before the run starts, which
-`runs-on` and `strategy.matrix` need evaluated before any step runs. For a value the run
-itself computes, reach for [the shared store](#sharing-variables-across-workflows) instead:
-it needs no `needs:` edge at all, and it works across workflow files.
-
-> Passing a value into a shell script? Prefer `env:` over inlining the expression — it
-> keeps quoting sane and multi-line values intact:
->
-> ```yaml
-> - env:
->     NOTES: ${{ fromJSON(steps.vars.outputs.json).release_notes }}
->   run: printf '%s' "$NOTES" > notes.txt
-> ```
-
-## Structured values
-
-**v1 resolves top-level keys only.** Precedence is evaluated per top-level key: a key
-present in the config file replaces the default entirely. There is no deep merge, and
-there is no dotted-path access.
-
-Values, however, may be any YAML type:
-
-| YAML value | Resolved to |
-|---|---|
-| `"20"` | `20` |
-| `20` | `20` |
-| `true` / `false` | `true` / `false` (lowercase strings) |
-| `null` / empty | `` (empty string) |
-| `[18, 20, 24]` | `[18,20,24]` (compact JSON) |
-| `{target: prod}` | `{"target":"prod"}` (compact JSON) |
-| a `\|` block scalar | the text, newlines intact |
-
-Lists and mappings arrive as JSON strings, so consuming them takes a `fromJSON()` at the
-point of use:
-
-```yaml
-# am-build-vars.yml
-test_matrix: ["18", "20", "24"]
-```
-
-```yaml
-strategy:
-  matrix:
-    node: ${{ fromJSON(needs.config.outputs.test_matrix) }}
-```
-
-> **Quote your version numbers.** YAML reads unquoted `20.10` as the float `20.1` and
-> unquoted `on`, `yes` and `no` as booleans. `"20.10"` gives you the string you meant.
-
-## Key naming
-
-Keys must match `^[A-Za-z_][A-Za-z0-9_]*$` — letters, digits and underscores, not starting
-with a digit. Use `node_version`, not `node-version` or `node.version`.
-
-This is enforced rather than silently rewritten, so the JSON key and the environment
-variable name are always the same string. A dashed key that became `node_version` in the
-environment but stayed `node-version` in `json` would be a permanent source of confusion.
-
-## Errors
-
-The action fails, with a message naming the file, when:
-
-- the YAML is malformed (the parser's line and column are included);
-- the top level of the file or of `defaults` is not a mapping;
-- `am-build-vars.yml` exists in **both** the root and `.github/` — the action refuses to
-  pick one silently;
-- an `am-build-vars.yaml` exists and no `.yml` does. Only `.yml` is read, and quietly
-  building with fleet defaults instead of the config you wrote is the worse outcome, so
-  this is an error telling you to rename it;
-- a key is not a valid name, or collides with a runner-owned variable;
-- `fail-on-missing: true` and the file is absent.
-
-A missing config file is **not** an error in the default configuration.
-
-Sharing adds its own, all of them naming what to fix:
-
-- `share-env` names a variable that is not set when the step runs;
-- a shared key is not a valid name, or collides with a runner-owned variable;
-- the token cannot read the repository's artifacts — the message names the
-  `actions: read` permission;
-- the store is unreadable: not JSON, or written by a newer schema than this action reads.
-  A corrupted store is an error rather than a silent fall-through to nothing, because the
-  caller asked for values a previous run published and quietly building without them is
-  the confusing outcome;
-- the store would grow past 512 KiB. It is meant for build coordinates, not payloads.
-
-Finding **no** store is not an error: the first run in a new scope resolves zero shared
-keys and carries on.
 
 ## Security
 
@@ -607,9 +642,9 @@ other change in that release. Breaking changes get a new major and a new tag; th
 never arrive through `v1`.
 
 ```yaml
-- uses: dawg-io/am-build-vars@v1        # newest v1.x — recommended
-- uses: dawg-io/am-build-vars@v1.0.0    # exactly this release
-- uses: dawg-io/am-build-vars@6f4c9d2   # exactly this commit
+- uses: greywolflabs/am-build-vars@v1        # newest v1.x — recommended
+- uses: greywolflabs/am-build-vars@v1.0.0    # exactly this release
+- uses: greywolflabs/am-build-vars@6f4c9d2   # exactly this commit
 ```
 
 Pin the SHA if your policy is that a third-party action must never change under
@@ -656,5 +691,5 @@ from the runner image.
 
 MIT — see [LICENSE](LICENSE).
 
-[am]: https://github.com/dawg-io
+[am]: https://actionsmanager.io
 [upload]: https://github.com/actions/upload-artifact
